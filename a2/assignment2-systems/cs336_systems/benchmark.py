@@ -2,8 +2,14 @@ import torch
 import torch.nn as nn
 import timeit
 import argparse
+import contextlib
+
+import torch.cuda.nvtx as nvtx
 import numpy as np
-from cs336_basics.model import BasicsTransformerLM
+# from cs336_basics.model import BasicsTransformerLM
+from cs336_basics.transformerLM import TransformerLM
+# print(f"CS336 Basics loaded from: {cs336_basics.__file__}")
+from cs336_basics.optimizer import MyAdamW, gradient_clipping
 
 # 定义不同模型大小的配置字典，方便调用
 MODEL_CONFIGS = {
@@ -31,6 +37,8 @@ def get_args():
     parser.add_argument("--measure_steps", type=int, default=10, help="Number of steps to measure [cite: 83]")
     parser.add_argument("--mode", type=str, default="fwd", choices=["fwd", "fwd_bwd"],
                         help="Mode: 'fwd' (forward only) or 'fwd_bwd' (forward + backward)")
+    parser.add_argument("--mixed_precision", action="store_true", 
+                        help="Enable mixed precision with BF16")
     
     return parser.parse_args()
 
@@ -51,9 +59,9 @@ def benchmark():
     print(f"Using device: {device}")
     
     # 初始化模型
-    model = BasicsTransformerLM(
+    model = TransformerLM(
         vocab_size=10000,
-        context_length=args.context_length,
+        context_size=args.context_length,
         d_model=config["d_model"],
         d_ff=config["d_ff"],
         num_layers=config["num_layers"],
@@ -62,6 +70,10 @@ def benchmark():
     )
     model.to(device)
     model.train()
+    optimizer = MyAdamW(
+        params=model.parameters(),
+    )
+
 
     # 生成随机数据
     # 输入 x 是整数索引，范围在 0 到 vocab_size 之间
@@ -69,30 +81,52 @@ def benchmark():
     # 如果需要计算 Loss，我们需要目标 target (对于语言模型通常是 x 的移位，这里为了测速随机生成即可)
     target = torch.randint(0, 10000, (args.batch_size, args.context_length), device=device)
     criterion = torch.nn.CrossEntropyLoss()
+
+    if args.mixed_precision:
+        ctx = torch.autocast(device_type=device, dtype=torch.bfloat16)
+    else :
+        ctx = contextlib.nullcontext()
     # 定义运行一步的函数
     def run_step():
         # 前向传播
-        logits = model(x)
-        
-        if args.mode == "fwd_bwd":
-            # 如果需要反向传播，我们需要计算一个 Loss
-            loss = criterion(logits.view(-1, logits.size(-1)), target.view(-1))
-            loss.backward()
+        optimizer.zero_grad()
+
+        with ctx:
+            with nvtx.range("Forward Pass"):
+                logits = model(x)
             
+            # 计算Loss
+            with nvtx.range("Compute Loss"):
+                loss = criterion(logits.view(-1, logits.size(-1)), target.view(-1))
+
+        if args.mode == "fwd_bwd":
+            # 反向传播
+            with nvtx.range("Backward Pass"):
+                loss.backward()
+            # 梯度裁剪
+            with nvtx.range("Gradient clipping"):
+                gradient_clipping(model.parameters(), 1.0)
+            # 优化
+            with nvtx.range("Optimizer"):
+                optimizer.step()
             # 每次反向传播后清空梯度，防止累积占用显存或影响计算
-            model.zero_grad()
+            with nvtx.range("Zero Grad"):
+                model.zero_grad()
 
         # 等待 GPU 完成所有计算
         if device == "cuda":
             torch.cuda.synchronize()
         elif device == "mps":
-            torch.mps.synchronize() # 如果你以后开启了 Mac 的 GPU 加速 (MPS)
+            torch.mps.synchronize() 
 
     # 预热 (Warm-up)
     print(f"Starting {args.warmup_steps} warm-up steps...")
-    for _ in range(args.warmup_steps):
-        run_step()
+    with nvtx.range("Warm-up"):
+        for _ in range(args.warmup_steps):
+            run_step()
 
+    # 开始记录内存历史。
+    torch.cuda.memory._record_memory_history(max_entries=1000000)
     # 正式计时
     print(f"Measuring {args.measure_steps} steps...")
     times = []
@@ -111,6 +145,12 @@ def benchmark():
     times_np = np.array(times)
     avg_time = np.mean(times_np)
     std_time = np.std(times_np)
+
+    # 保存一个 pickle 文件以供 PyTorch 的在线工具加载。
+    torch.cuda.memory._dump_snapshot("memory_snapshot.pickle")
+
+    # 停止记录历史。
+    torch.cuda.memory._record_memory_history(enabled=None)
 
     print("-" * 30)
     print(f"times: {[f'{t:.6f}' for t in times]}")
