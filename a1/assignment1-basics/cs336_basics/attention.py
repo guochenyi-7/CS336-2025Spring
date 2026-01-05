@@ -94,7 +94,7 @@ class MultiheadSelfAttentionWithRoPE(nn.Module):
 
         # 预先生成一个足够大的下三角 Mask
         mask = torch.tril(torch.ones(max_seq_len, max_seq_len))
-        # 注册为 buffer，这样它会被视为模型状态的一部分，不需要每次计算
+        # 注册为buffer，这样它会被视为模型状态的一部分，不需要每次计算
         self.register_buffer("causal_mask", mask)
 
     def forward(
