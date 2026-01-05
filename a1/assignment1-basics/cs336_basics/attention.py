@@ -69,6 +69,8 @@ class MultiheadSelfAttention(nn.Module):
 
 
 class MultiheadSelfAttentionWithRoPE(nn.Module):
+    causal_mask: torch.Tensor
+    
     def __init__(
             self, 
             d_model: int, 
@@ -90,6 +92,11 @@ class MultiheadSelfAttentionWithRoPE(nn.Module):
         self.attention = ScaledDotProductAttention()
         self.RoPE = RoPE(theta=theta, d_k=self.head_dim, max_seq_len=max_seq_len, device=device, dtype=dtype)
 
+        # 预先生成一个足够大的下三角 Mask
+        mask = torch.tril(torch.ones(max_seq_len, max_seq_len))
+        # 注册为 buffer，这样它会被视为模型状态的一部分，不需要每次计算
+        self.register_buffer("causal_mask", mask)
+
     def forward(
             self, 
             x: Float[Tensor, "batch seq_len d_model"],
@@ -106,7 +113,8 @@ class MultiheadSelfAttentionWithRoPE(nn.Module):
         Q = self.RoPE(Q, token_positions)
         K = self.RoPE(K, token_positions)
 
-        mask = torch.tril(torch.ones((seq_len, seq_len), device=x.device, dtype=torch.bool))
+        # mask = torch.tril(torch.ones((seq_len, seq_len), device=x.device, dtype=torch.bool))
+        mask = self.causal_mask[:seq_len, :seq_len]
         attn = self.attention(Q, K, V, mask)
 
         attn = rearrange(attn, "batch num_heads seq_len head_dim -> batch seq_len (num_heads head_dim)", num_heads=self.num_heads)
