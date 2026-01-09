@@ -99,8 +99,40 @@ class FlashattentionWithPytorch(torch.autograd.Function):
         return O
     
     @staticmethod
-    def backward(ctx, dO): # type: ignore
-        raise NotImplementedError("Backward pass not implemented yet")
+    def backward(ctx, dO): 
+        # 获取前向传播中保存的信息
+        Q, K, V, O, L = ctx.saved_tensors
+        is_causal = ctx.is_causal
+        
+        head_dim = Q.shape[-1]
+        scale = 1.0 / math.sqrt(head_dim)
+
+        # 重计算S
+        S = Q @ K.transpose(-2, -1) * scale
+        # mask
+        if is_causal:
+            seq_len_q = Q.shape[-2]
+            seq_len_k = K.shape[-2]
+            rows = torch.arange(seq_len_q, device=Q.device).unsqueeze(1)
+            cols = torch.arange(seq_len_k, device=K.device).unsqueeze(0)
+            mask = cols > rows
+            S = S.masked_fill(mask, float('-inf'))
+        # 计算P
+        P = torch.exp(S - L.unsqueeze(-1))
+        # 计算dV = P_t @ dO
+        dV = P.transpose(-2, -1) @ dO
+        # 计算dP = dO @ V_t
+        dP = dO @ V.transpose(-2, -1)
+        # 计算D = rowsum(dO 点乘 O)
+        D = torch.sum(dO * O, dim=-1, keepdim=True)
+        # 计算dS = P 点乘(dP - D)
+        dS = P * (dP - D)
+        # 计算dQ = scale * dS @ K
+        dQ = dS @ K * scale
+        # 计算dK = scale *。dS_t @ Q
+        dK = dS.transpose(-2, -1) @ Q * scale
+        return dQ, dK, dV, None
+
 
 def flash_attention_reference(q, k, v, is_causal=False):
     return FlashattentionWithPytorch.apply(q, k, v, is_causal)
