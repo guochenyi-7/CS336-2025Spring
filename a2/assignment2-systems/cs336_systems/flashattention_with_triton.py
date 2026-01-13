@@ -4,6 +4,8 @@ import triton
 import math
 import triton.language as tl
 
+tile_size = 32
+
 @triton.jit
 def flashattention_fwd_kernel(
     Q_ptr, K_ptr, V_ptr, O_ptr, L_ptr,
@@ -432,8 +434,8 @@ class FlashattentionWithTriton(torch.autograd.Function):
         seq_len_k = K.shape[-2]
 
         # 设置分块大小
-        Q_tile_size = 64
-        K_tile_size = 64
+        Q_tile_size = tile_size
+        K_tile_size = tile_size
 
         # 初始化输出
         O = torch.zeros_like(Q)
@@ -472,8 +474,8 @@ class FlashattentionWithTriton(torch.autograd.Function):
         scale = 1.0 / math.sqrt(head_dim)
 
         # 设置分块大小
-        Q_tile_size = 64
-        K_tile_size = 64
+        Q_tile_size = tile_size
+        K_tile_size = tile_size
 
         # 初始化输出
         dQ = torch.zeros_like(Q)
