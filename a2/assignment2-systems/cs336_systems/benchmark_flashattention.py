@@ -193,7 +193,7 @@ def main():
 
     # 保存结果
     df = pd.DataFrame(results)
-    df.to_csv("benchmark_4090d.csv", index=False)
+    df.to_csv("benchmark_comparison.csv", index=False)
     print("\n结果已保存至 benchmark_comparison.csv")
 
 if __name__ == "__main__":
