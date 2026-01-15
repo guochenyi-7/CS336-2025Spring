@@ -53,7 +53,7 @@ def distributed_all(model):
         # 将所有梯度打平成一个连续的大张量
         flat_grads = _flatten_dense_tensors(grads)
         
-        # 仅发起一次 all-reduce 调用 [cite: 1295]
+        # 仅发起一次 all-reduce 调用
         dist.all_reduce(flat_grads, op=dist.ReduceOp.SUM)
         flat_grads /= world_size
         
