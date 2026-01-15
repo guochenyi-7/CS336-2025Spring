@@ -6,6 +6,8 @@ import torch.optim as optim
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
+
 class ToyModel(nn.Module):
     def __init__(self):
         super().__init__()
@@ -43,6 +45,32 @@ def setup(rank, world_size):
 def cleanup():
     dist.destroy_process_group()
 
+def distributed_each(model):
+     world_size = dist.get_world_size()
+     for param in model.parameters():
+            if param.grad is not None:
+                dist.all_reduce(param.grad, op=dist.ReduceOp.SUM)
+                param.grad /= world_size
+
+def distributed_all(model):
+    world_size = dist.get_world_size()
+    grads = [param.grad for param in model.parameters() if param.grad is not None]
+        
+    if len(grads) > 0:
+        # 将所有梯度打平成一个连续的大张量
+        flat_grads = _flatten_dense_tensors(grads)
+        
+        # 仅发起一次 all-reduce 调用 [cite: 1295]
+        dist.all_reduce(flat_grads, op=dist.ReduceOp.SUM)
+        flat_grads /= world_size
+        
+        # 将同步后的梯度写回原张量
+        # _unflatten_dense_tensors 返回的是新张量列表，需要拷贝回 grads
+        synced_grads = _unflatten_dense_tensors(flat_grads, grads)
+        for old_grad, new_grad in zip(grads, synced_grads):
+            old_grad.copy_(new_grad)
+
+
 def run_ddp_process(rank, world_size, input_data, target_data, steps=5, return_dict=None):
     setup(rank, world_size)
 
@@ -73,10 +101,7 @@ def run_ddp_process(rank, world_size, input_data, target_data, steps=5, return_d
         loss = loss_fn(output, local_target)
         loss.backward()
         # 同步梯度
-        for param in model.parameters():
-            if param.grad is not None:
-                dist.all_reduce(param.grad, op=dist.ReduceOp.SUM)
-                param.grad /= world_size
+        distributed_each(model)
         optimizer.step()
     
     if rank == 0 and return_dict is not None:

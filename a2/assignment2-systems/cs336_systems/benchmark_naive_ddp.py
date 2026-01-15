@@ -8,6 +8,7 @@ import torch.multiprocessing as mp
 import pandas as pd
 
 from cs336_basics.transformerLM import TransformerLM
+from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 
 MODEL_CONFIG_XL = {
     "vocab_size": 10000,
@@ -36,6 +37,31 @@ def setup(rank, world_size):
     dist.init_process_group(backend, rank=rank, world_size=world_size)
     if torch.cuda.is_available():
         torch.cuda.set_device(rank)
+
+def distributed_each(model):
+     world_size = dist.get_world_size()
+     for param in model.parameters():
+            if param.grad is not None:
+                dist.all_reduce(param.grad, op=dist.ReduceOp.SUM)
+                param.grad /= world_size
+
+def distributed_all(model):
+    world_size = dist.get_world_size()
+    grads = [param.grad for param in model.parameters() if param.grad is not None]
+        
+    if len(grads) > 0:
+        # 将所有梯度打平成一个连续的大张量
+        flat_grads = _flatten_dense_tensors(grads)
+        
+        # 仅发起一次 all-reduce 调用 [cite: 1295]
+        dist.all_reduce(flat_grads, op=dist.ReduceOp.SUM)
+        flat_grads /= world_size
+        
+        # 将同步后的梯度写回原张量
+        # _unflatten_dense_tensors 返回的是新张量列表，需要拷贝回 grads
+        synced_grads = _unflatten_dense_tensors(flat_grads, grads)
+        for old_grad, new_grad in zip(grads, synced_grads):
+            old_grad.copy_(new_grad)
 
 def run_benchmark_process(rank, world_size, args):
     setup(rank, world_size)
@@ -101,12 +127,10 @@ def run_benchmark_process(rank, world_size, args):
             torch.cuda.synchronize() # 等待反向传播计算完成
         
         # --- 测量通信时间 ---
-        comm_start = time.time() 
-        for param in model.parameters():
-            if param.grad is not None:
-                # Naive DDP: 单个参数逐一通信
-                dist.all_reduce(param.grad, op=dist.ReduceOp.SUM)
-                param.grad /= world_size
+        comm_start = time.time()
+        
+        distributed_each(model)
+
         if torch.cuda.is_available():
             torch.cuda.synchronize() # 等待所有通信完成
         comm_end = time.time()
