@@ -9,15 +9,16 @@ import pandas as pd
 
 from cs336_basics.transformerLM import TransformerLM
 from cs336_systems.ddp_overlap_individual_parameters import DdpOverlapIndividualParameters
+from cs336_systems.bucketed_ddp import BucketedDDP
 from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 
 MODEL_CONFIG_XL = {
-    "vocab_size": 10000,
-    "context_size": 128,
-    "d_model": 1600,
-    "d_ff": 6400,
-    "num_layers": 12,
-    "num_heads": 25,
+    "vocab_size": 50257,
+    "context_size": 1024,
+    "d_model": 1200,      
+    "d_ff": 4800,           
+    "num_layers": 10,
+    "num_heads": 24,
     "rope_theta": 10000,
 }
 
@@ -67,9 +68,14 @@ def distributed_all(model):
 
 def run_benchmark_process(rank, world_size, args):
     setup(rank, world_size)
-    mode = args.get('mode', 'naive') # 'naive' 或 'overlap'
+    
+    # 从 args 中获取配置
+    mode = args.get('mode', 'naive')
+    bucket_size_mb = args.get('bucket_size_mb', 25.0)
+    
     device = torch.device(f"cuda:{rank}" if torch.cuda.is_available() else "cpu")
-    torch.manual_seed(42 + rank)
+    # 保证每个进程的初始权重和数据分布在测量中具有一致性
+    torch.manual_seed(42) 
 
     # 初始化模型
     raw_model = TransformerLM(**MODEL_CONFIG_XL).to(device)
@@ -77,27 +83,30 @@ def run_benchmark_process(rank, world_size, args):
     # 根据模式包装模型
     if mode == 'overlap':
         model = DdpOverlapIndividualParameters(raw_model)
+    elif mode == 'bucketed':
+        model = BucketedDDP(raw_model, bucket_size_mb=bucket_size_mb)
     else:
+        # 朴素模式：手动广播
         model = raw_model
-        # 朴素模式手动广播权重
         for param in model.parameters():
             dist.broadcast(param.data, src=0)
     
     optimizer = optim.AdamW(model.parameters(), lr=1e-4)
     loss_fn = nn.CrossEntropyLoss()
     
-    # 准备随机数据
+    # 3. 准备随机数据
     x = torch.randint(0, MODEL_CONFIG_XL["vocab_size"], (4, MODEL_CONFIG_XL["context_size"])).to(device)
     y = torch.randint(0, MODEL_CONFIG_XL["vocab_size"], (4 * MODEL_CONFIG_XL["context_size"],)).to(device)
     
-    # --- 预热 (Warmup) ---
-    for _ in range(3):
+    # --- 预热阶段 (Warmup) ---
+    for _ in range(5):
         optimizer.zero_grad()
         output = model(x).view(-1, MODEL_CONFIG_XL["vocab_size"])
         loss = loss_fn(output, y)
         loss.backward()
-        if mode == 'overlap':
-            model.finish_gradient_synchronization() #
+        
+        if mode in ['overlap', 'bucketed']:
+            model.finish_gradient_synchronization()
         else:
             distributed_all(model)
         optimizer.step()
@@ -108,62 +117,76 @@ def run_benchmark_process(rank, world_size, args):
     if rank == 0:
         print(f"[{mode.upper()}] Warmup finished. Starting benchmark...")
         
-    # --- 正式测量 ---
+    # --- 正式测量阶段 ---
     num_steps = 10
     total_step_times = []
-    bw_comm_times = [] # 重点：反向传播 + 梯度同步的总时间
+    bw_comm_times = [] # 测量反向传播 + 梯度同步的总耗时
     
     for step in range(num_steps):
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         step_start = time.time()
         
+        # --- 前向传播 ---
         optimizer.zero_grad()
         output = model(x).view(-1, MODEL_CONFIG_XL["vocab_size"])
         loss = loss_fn(output, y)
         
-        # 测量计算+通信重叠的时间点
+        # --- 反向传播 + 通信 ---
         bw_start = time.time()
-        
         loss.backward()
         
-        if mode == 'overlap':
-            # 内部执行 handle.wait() 和梯度平均
+        if mode in ['overlap', 'bucketed']:
+            # 等待所有后端的 all-reduce handle 完成，并进行梯度平均
             model.finish_gradient_synchronization() 
         else:
-            # 朴素模式：先等计算完，再开始通信
+            # Naive 模式：必须先同步保证 Backward 结束，再发起同步
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
             distributed_all(model) 
 
         if torch.cuda.is_available():
-            torch.cuda.synchronize()
+            torch.cuda.synchronize() # 确保所有 GPU 操作完成
         bw_end = time.time()
         
+        # --- 优化器更新 ---
         optimizer.step()
+        
         step_end = time.time()
         
         total_step_times.append((step_end - step_start) * 1000)
         bw_comm_times.append((bw_end - bw_start) * 1000)
         
+    # 汇总结果
     if rank == 0:
         avg_total = sum(total_step_times) / len(total_step_times)
         avg_bw_comm = sum(bw_comm_times) / len(bw_comm_times)
         print(f"\n=== {mode.upper()} DDP Results ===")
+        if mode == 'bucketed':
+            print(f"Bucket Size: {bucket_size_mb} MB")
         print(f"Avg Total Step Time: {avg_total:.2f} ms")
         print(f"Avg (Backward + Comm) Time: {avg_bw_comm:.2f} ms")
         
     dist.destroy_process_group()
-    
-def benchmark_naive_ddp():
+
+def benchmark_all_strategies():
     world_size = 2
-    for mode in ['naive', 'overlap']:
+    test_configs = [
+        {'mode': 'naive'},
+        {'mode': 'overlap'},
+        {'mode': 'bucketed', 'bucket_size_mb': 1.0},
+        {'mode': 'bucketed', 'bucket_size_mb': 10.0}, 
+        {'mode': 'bucketed', 'bucket_size_mb': 100.0}, 
+        {'mode': 'bucketed', 'bucket_size_mb': 1000.0}, 
+    ]
+    
+    for config in test_configs:
         mp.spawn(
             run_benchmark_process,
-            args=(world_size, {'mode': mode}),
+            args=(world_size, config),
             nprocs=world_size,
             join=True
         )
 
 if __name__ == "__main__":
-    benchmark_naive_ddp()
+    benchmark_all_strategies()
