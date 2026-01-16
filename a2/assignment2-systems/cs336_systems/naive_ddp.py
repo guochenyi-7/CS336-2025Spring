@@ -25,6 +25,9 @@ def run_single_process(input_data, target_data, steps=5):
     optimizer = optim.SGD(model.parameters(), lr=0.01)
     loss_fn = nn.MSELoss()
 
+    input_data = input_data.to(device)
+    target_data = target_data.to(device)
+
     for _ in range(steps):
         optimizer.zero_grad()
         out_put = model(input_data)
@@ -32,7 +35,7 @@ def run_single_process(input_data, target_data, steps=5):
         loss.backward()
         optimizer.step()
 
-    return model.state_dict()
+    return {k: v.detach().cpu() for k, v in model.state_dict().items()}
 
 def setup(rank, world_size):
     os.environ["MASTER_ADDR"] = "localhost"
@@ -106,7 +109,7 @@ def run_ddp_process(rank, world_size, input_data, target_data, steps=5, return_d
     
     if rank == 0 and return_dict is not None:
         # 深拷贝状态字典
-        return_dict['state_dict'] = {k: v.clone() for k, v in model.state_dict().items()}
+        return_dict['state_dict'] = {k: v.detach().cpu() for k, v in model.state_dict().items()}
         
     cleanup()
 

@@ -8,6 +8,7 @@ import torch.multiprocessing as mp
 import pandas as pd
 
 from cs336_basics.transformerLM import TransformerLM
+from cs336_systems.ddp_overlap_individual_parameters import DdpOverlapIndividualParameters
 from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 
 MODEL_CONFIG_XL = {
@@ -15,7 +16,7 @@ MODEL_CONFIG_XL = {
     "context_size": 128,
     "d_model": 1600,
     "d_ff": 6400,
-    "num_layers": 48,
+    "num_layers": 12,
     "num_heads": 25,
     "rope_theta": 10000,
 }
@@ -63,110 +64,106 @@ def distributed_all(model):
         for old_grad, new_grad in zip(grads, synced_grads):
             old_grad.copy_(new_grad)
 
+
 def run_benchmark_process(rank, world_size, args):
     setup(rank, world_size)
-
+    mode = args.get('mode', 'naive') # 'naive' 或 'overlap'
     device = torch.device(f"cuda:{rank}" if torch.cuda.is_available() else "cpu")
-
     torch.manual_seed(42 + rank)
 
-    model = TransformerLM(**MODEL_CONFIG_XL)
-    model = model.to(device)
-
-    # 广播初始权重
-    for param in model.parameters():
-        dist.broadcast(param.data, src=0)
+    # 初始化模型
+    raw_model = TransformerLM(**MODEL_CONFIG_XL).to(device)
     
+    # 根据模式包装模型
+    if mode == 'overlap':
+        model = DdpOverlapIndividualParameters(raw_model)
+    else:
+        model = raw_model
+        # 朴素模式手动广播权重
+        for param in model.parameters():
+            dist.broadcast(param.data, src=0)
     
     optimizer = optim.AdamW(model.parameters(), lr=1e-4)
     loss_fn = nn.CrossEntropyLoss()
     
-    # 随机数据
-    batch_size = 4
-    vocab_size = MODEL_CONFIG_XL["vocab_size"]
-    context_len = MODEL_CONFIG_XL["context_size"]
+    # 准备随机数据
+    x = torch.randint(0, MODEL_CONFIG_XL["vocab_size"], (4, MODEL_CONFIG_XL["context_size"])).to(device)
+    y = torch.randint(0, MODEL_CONFIG_XL["vocab_size"], (4 * MODEL_CONFIG_XL["context_size"],)).to(device)
     
-    # 预生成一批数据
-    x = torch.randint(0, vocab_size, (batch_size, context_len)).to(device)
-    y = torch.randint(0, vocab_size, (batch_size * context_len,)).to(device) #Flatten targets
-    
-    # 预热 
+    # --- 预热 (Warmup) ---
     for _ in range(3):
         optimizer.zero_grad()
-        output = model(x) 
-        output = output.view(-1, vocab_size)
+        output = model(x).view(-1, MODEL_CONFIG_XL["vocab_size"])
         loss = loss_fn(output, y)
         loss.backward()
-        for param in model.parameters():
-            if param.grad is not None:
-                dist.all_reduce(param.grad, op=dist.ReduceOp.SUM)
-                param.grad /= world_size
+        if mode == 'overlap':
+            model.finish_gradient_synchronization() #
+        else:
+            distributed_all(model)
         optimizer.step()
     
     if torch.cuda.is_available():
         torch.cuda.synchronize()
 
     if rank == 0:
-        print("Warmup finished. Starting benchmark...")
+        print(f"[{mode.upper()}] Warmup finished. Starting benchmark...")
         
-    # 正式测量
+    # --- 正式测量 ---
     num_steps = 10
-    total_times = []
-    comm_times = []
+    total_step_times = []
+    bw_comm_times = [] # 重点：反向传播 + 梯度同步的总时间
     
     for step in range(num_steps):
-        step_start = time.time() # CPU 时间 (Python overhead 也是重点)
-        
-        optimizer.zero_grad()
-        output = model(x)
-        output = output.view(-1, vocab_size)
-        loss = loss_fn(output, y)
-        loss.backward()
-        
-        if torch.cuda.is_available():
-            torch.cuda.synchronize() # 等待反向传播计算完成
-        
-        # --- 测量通信时间 ---
-        comm_start = time.time()
-        
-        distributed_each(model)
-
-        if torch.cuda.is_available():
-            torch.cuda.synchronize() # 等待所有通信完成
-        comm_end = time.time()
-        # -------------------
-        
-        optimizer.step()
         if torch.cuda.is_available():
             torch.cuda.synchronize()
+        step_start = time.time()
+        
+        optimizer.zero_grad()
+        output = model(x).view(-1, MODEL_CONFIG_XL["vocab_size"])
+        loss = loss_fn(output, y)
+        
+        # 测量计算+通信重叠的时间点
+        bw_start = time.time()
+        
+        loss.backward()
+        
+        if mode == 'overlap':
+            # 内部执行 handle.wait() 和梯度平均
+            model.finish_gradient_synchronization() 
+        else:
+            # 朴素模式：先等计算完，再开始通信
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            distributed_all(model) 
+
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        bw_end = time.time()
+        
+        optimizer.step()
         step_end = time.time()
         
-        total_times.append((step_end - step_start) * 1000) # 转为 ms
-        comm_times.append((comm_end - comm_start) * 1000) # 转为 ms
+        total_step_times.append((step_end - step_start) * 1000)
+        bw_comm_times.append((bw_end - bw_start) * 1000)
         
-    # 报告结果
     if rank == 0:
-        avg_total = sum(total_times) / len(total_times)
-        avg_comm = sum(comm_times) / len(comm_times)
-        comm_ratio = (avg_comm / avg_total) * 100
-        
-        print("\n=== Naive DDP Benchmark Results (XL Model) ===")
-        print(f"Config: {MODEL_CONFIG_XL}")
-        print(f"Num GPUs: {world_size}")
-        print(f"Avg Total Time per Step: {avg_total:.2f} ms")
-        print(f"Avg Communication Time:  {avg_comm:.2f} ms")
-        print(f"Communication Overhead:  {comm_ratio:.2f}%")
+        avg_total = sum(total_step_times) / len(total_step_times)
+        avg_bw_comm = sum(bw_comm_times) / len(bw_comm_times)
+        print(f"\n=== {mode.upper()} DDP Results ===")
+        print(f"Avg Total Step Time: {avg_total:.2f} ms")
+        print(f"Avg (Backward + Comm) Time: {avg_bw_comm:.2f} ms")
         
     dist.destroy_process_group()
-
+    
 def benchmark_naive_ddp():
     world_size = 2
-    mp.spawn(
-        run_benchmark_process,
-        args=(world_size, None),
-        nprocs=world_size,
-        join=True
-    )
+    for mode in ['naive', 'overlap']:
+        mp.spawn(
+            run_benchmark_process,
+            args=(world_size, {'mode': mode}),
+            nprocs=world_size,
+            join=True
+        )
 
 if __name__ == "__main__":
     benchmark_naive_ddp()
