@@ -6,6 +6,7 @@ import torch
 
 from cs336_systems.flashattention_with_pytorch import FlashattentionWithPytorch
 from cs336_systems.flashattention_with_triton  import FlashattentionWithTriton
+from cs336_systems.ddp_overlap_individual_parameters import DdpOverlapIndividualParameters
 
 
 
@@ -56,7 +57,7 @@ def get_ddp_individual_parameters(module: torch.nn.Module) -> torch.nn.Module:
         Instance of a DDP class.
     """
     # For example: return DDPIndividualParameters(module)
-    raise NotImplementedError
+    return DdpOverlapIndividualParameters(module)
 
 
 def ddp_individual_parameters_on_after_backward(ddp_model: torch.nn.Module, optimizer: torch.optim.Optimizer):
