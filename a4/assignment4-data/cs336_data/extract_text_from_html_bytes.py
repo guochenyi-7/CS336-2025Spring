@@ -23,7 +23,7 @@ def extract_text_from_html_bytes(html_bytes: bytes) -> str:
         try:
             decoded_html = html_bytes.decode(encoding)
         except (LookupError, UnicodeDecodeError):
-            decoded_html = html_bytes.decode("utf-8", error="replace")
+            decoded_html = html_bytes.decode("utf-8", errors="replace")
 
     return extract_plain_text(decoded_html, main_content=False, alt_texts=True)
 
