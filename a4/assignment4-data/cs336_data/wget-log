@@ -1,0 +1,24 @@
+Connecting to www.scottishfa.co.uk (www.scottishfa.co.uk)|143.244.56.56|:80... connected.
+HTTP request sent, awaiting response... 301 Moved Permanently
+Location: https://www.scottishfa.co.uk/scottish_fa_news.cfm?page=1848&amp [following]
+
+     0K                                                       100% 11.9M=0s
+
+--2026-02-01 20:44:42--  https://www.scottishfa.co.uk/scottish_fa_news.cfm?page=1848&amp
+Connecting to www.scottishfa.co.uk (www.scottishfa.co.uk)|143.244.56.56|:443... connected.
+HTTP request sent, awaiting response... 200 OK
+Cookie coming from www.scottishfa.co.uk attempted to set domain to sfa-mainsite.azurewebsites.net
+Cookie coming from www.scottishfa.co.uk attempted to set domain to sfa-mainsite.azurewebsites.net
+Length: unspecified [text/html]
+Saving to: ‘/dev/null’
+
+     0K .......... .......... .......... .......... ..........  110K
+    50K .......... .......... .......... .......... ..........  238K
+   100K .......... .......... .......... .......... ..........  291K
+   150K .......... .......... .......... .......... ..          738K=0.9s
+
+2026-02-01 20:44:47 (216 KB/s) - ‘/dev/null’ saved [197631]
+
+--2026-02-01 20:44:47--  http://www.washingtonblade.com/2014/12/10/gay-man-sworn-u-s-ambassador-vietnam/
+Resolving www.washingtonblade.com (www.washingtonblade.com)... 172.67.139.160, 104.21.33.10, 2606:4700:3031::ac43:8ba0, ...
+Connecting to www.washingtonblade.com (www.washingtonblade.com)|172.67.139.160|:80... 
