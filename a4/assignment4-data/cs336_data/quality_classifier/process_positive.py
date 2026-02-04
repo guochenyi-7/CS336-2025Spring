@@ -1,51 +1,81 @@
+import json
 import os
-import sys
-from fastwarc.warc import ArchiveIterator, WarcRecordType
+import random
 
-from cs336_data.extract_text_from_html_bytes import extract_text_from_html_bytes
-from cs336_data.language_identification import identify_language
-from cs336_data.gopher_quality_filters import gopher_quality_filter
+# 配置路径
+INPUT_DIR = "data/extracted_wiki"  # WikiExtractor 输出的文件夹
+OUTPUT_FILE = "data/positive_samples.txt"
+SAMPLE_SIZE = 9883 
 
-INPUT_WARC = "cs336_data/data/positive_samples.warc.gz"
-OUTPUT_TRAIN_FILE = "cs336_data/data/positive_train_data.txt"
+def process_wiki_data():
+    # --- 调试信息 ---
+    print(f"当前工作目录: {os.getcwd()}")
+    if not os.path.exists(INPUT_DIR):
+        print(f"❌ 错误: 找不到目录 '{INPUT_DIR}'")
+        return
+    else:
+        print(f"✅ 找到目录 '{INPUT_DIR}'，正在扫描文件...")
 
-def process_warc(input_path, output_path):
-    count = 0
-    kept = 0
+    # --- 核心修改：使用 os.walk 递归查找所有文件 ---
+    all_files = []
+    for root, dirs, files in os.walk(INPUT_DIR):
+        for file in files:
+            # 过滤掉可能的隐藏文件或系统文件
+            if not file.startswith('.'):
+                full_path = os.path.join(root, file)
+                all_files.append(full_path)
 
-    with open(output_path, "w", encoding="uft-8") as out_f:
-        for record in ArchiveIterator(open(input_path, "rb"), record_types=WarcRecordType.response):
-            try:
-                html_bytes = record.reader.read()
-                text = extract_text_from_html_bytes(html_bytes)
-                if not text:
-                    continue
+    print(f"📂 找到 {len(all_files)} 个数据文件，开始处理...")
+    
+    if len(all_files) == 0:
+        print("⚠️ 警告：目录是空的，请检查 extracted_wiki 文件夹里有没有内容！")
+        return
 
-                # 语言过滤
-                lang, l_score = identify_language(text)
-                if lang != "en" or l_score < 0.6:
-                    continue
+    collected_samples = []
 
-                # Gopher 质量过滤
-                if gopher_quality_filter(text) == False:
-                    continue
+    # 遍历所有找到的文件
+    for file_path in all_files:
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    try:
+                        data = json.loads(line)
+                        text = data.get('text', '')
+                        title = data.get('title', '')
+                        
+                        # 拼接标题和正文
+                        full_text = f"{title}. {text}"
+                        
+                        # 清洗换行符 (Critical)
+                        clean_text = full_text.replace('\n', ' ').replace('\r', ' ')
+                        # 压缩多余空格
+                        clean_text = ' '.join(clean_text.split())
 
-                clean_text = text.replace("\n", ' ').replace("\r", ' ')
-                out_f.write(f"__label__high_quality {clean_text}\n")
+                        # 长度过滤
+                        if len(clean_text) > 100: # 稍微提高一点门槛
+                            collected_samples.append(clean_text)
 
-                kept += 1
+                    except json.JSONDecodeError:
+                        continue
+        except IsADirectoryError:
+            continue
+    
+    print(f"✅ 总共提取了 {len(collected_samples)} 条原始文章。")
 
-            except Exception as e:
-                print(f"Error processing record: {e}")
-                continue
-            
-            count += 1
+    # 随机采样
+    if len(collected_samples) > SAMPLE_SIZE:
+        print(f"🎲 数据过多，随机抽取 {SAMPLE_SIZE} 条...")
+        final_samples = random.sample(collected_samples, SAMPLE_SIZE)
+    else:
+        final_samples = collected_samples
 
-            if count % 1000 == 0:
-                print(f"Processed {count} records, kept {kept} high-quality examples.")
-
-        print(f"Finished! Total processed: {count}, Total kept: {kept}")
+    # 写入文件
+    print(f"💾 正在写入 {OUTPUT_FILE} ...")
+    with open(OUTPUT_FILE, 'w', encoding='utf-8') as out:
+        for text in final_samples:
+            out.write(f"__label__hq {text}\n")
+    
+    print("🎉 处理完成！")
 
 if __name__ == "__main__":
-    process_warc(INPUT_WARC, OUTPUT_TRAIN_FILE)
-    
+    process_wiki_data()
