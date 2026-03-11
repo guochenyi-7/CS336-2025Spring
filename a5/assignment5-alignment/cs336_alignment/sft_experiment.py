@@ -1,7 +1,9 @@
 import torch
 import wandb
 import json
+import sys
 
+from pathlib import Path
 from torch.nn.utils import clip_grad_norm_
 from vllm.model_executor import set_random_seed as vllm_set_random_seed
 from unittest.mock import patch
@@ -12,6 +14,64 @@ from cs336_alignment.get_response_log_probs import get_response_log_probs
 from cs336_alignment.sft_microbatch_train_step import sft_microbatch_train_step
 from cs336_alignment.drgrpo_grader import r1_zero_reward_fn
 
+from torch.utils.data import Dataset, DataLoader
+from cs336_alignment.tokenize_prompt_and_output import tokenize_prompt_and_output
+
+project_root = Path(__file__).parent.parent
+sys.path.insert(0, str(project_root))
+
+train_batch_size = 128
+
+class SFTDataset(Dataset):
+    def __init__(self, data_path, num_samples=None):
+        """
+        读取已经格式化好的 sft_formatted.jsonl 文件
+        """
+        self.data = []
+        with open(data_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                self.data.append(json.loads(line))
+                if num_samples and len(self.data) >= num_samples:
+                    break
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        return self.data[idx]
+    
+def create_collate_fn(tokenizer):
+    """
+    返回一个可用于 DataLoader 的 collate 函数，内部调用 tokenize_prompt_and_output
+    """
+    def collate_fn(batch):
+        # 提取 batch 中的 prompt 和 response
+        prompt_strs = [item["prompt"] for item in batch]
+        output_strs = [item["response"] for item in batch]
+
+        # 调用你作业中要求实现的 tokenize 函数
+        # 它应该返回形如 {"input_ids": ..., "labels": ..., "response_mask": ...} 的字典
+        tokenized_batch = tokenize_prompt_and_output(prompt_strs, output_strs, tokenizer)
+        return tokenized_batch
+    
+    return collate_fn
+
+# 复用之前做 baseline 时的模板
+PROMPTS_TEMPLATE = """A conversation between User and Assistant. The User asks a question, and the Assistant solves it. The Assistant first thinks about the reasoning process in the mind and then provides the User with the answer. The reasoning process is enclosed within <think> </think> and answer is enclosed within <answer> </answer> tags, respectively, i.e., <think> reasoning process here </think> <answer> answer here </answer>.
+User: {question}
+Assistant: <think>\n"""
+
+def load_val_data(val_file_path):
+    prompts = []
+    ground_truths = []
+    with open(val_file_path, "r", encoding="utf-8") as f:
+        for line in f:
+            item = json.loads(line)
+            prompts.append(PROMPTS_TEMPLATE.format(question=item["question"]))
+            # 如果 reward_fn 需要纯数字答案，这里可以 split("####")[-1].strip()
+            ground_truths.append(item["answer"]) 
+    return prompts, ground_truths
+
 def init_vllm(model_id: str, device: str, seed: int, gpu_memory_utilization: float = 0.85):
     """
     启动推理过程，这里我们使用 vLLM 将模型保存在一个与策略模型独立的 GPU 上。
@@ -20,9 +80,6 @@ def init_vllm(model_id: str, device: str, seed: int, gpu_memory_utilization: flo
     
     # 猴子补丁（Monkeypatch）来自 TRL：
     # https://github.com/huggingface/trl/blob/22759c820867c8659d00082ba8cf004e963873c1/trl/trainer/grpo_trainer.py
-    # 对 LLM 进行补丁，以确保我们可以：
-    # (1) 将 vLLM 模型放置在所需的设备上 (world_size_patch)；并且
-    # (2) 避免运行一个并非为我们设置设计的测试 (profiling_patch)。
     world_size_patch = patch("torch.distributed.get_world_size", return_value=1)
     profiling_patch = patch(
         "vllm.worker.worker.Worker._assert_memory_footprint_increased_during_profiling",
@@ -85,13 +142,27 @@ def run_sft_experiment():
     eval_interval = 50 # 每 50 个 step 评估一次
 
     # ==========================================
-    # 2. 数据加载与预处理 (伪代码)
+    # 2. 数据加载与预处理
     # ==========================================
-    # 读取 /data/a5-alignment/MATH/sft.jsonl
-    # 这里你需要将 jsonl 转换为 DataLoader，并在 collate_fn 中使用 tokenize_prompt_and_output
-    train_dataloader = get_sft_dataloader(...) 
-    val_prompts = get_val_prompts(...) # 读取 validation.jsonl 中的 prompts
-    val_ground_truths = get_val_ground_truths(...)
+    # 需要将 jsonl 转换为 DataLoader，并在 collate_fn 中使用 tokenize_prompt_and_output
+    # 定义路径
+    train_data_path = str(project_root / "data" / "gsm8k" / "sft_formatted.jsonl")
+    val_data_path = str(project_root / "data" / "gsm8k" / "test.jsonl")
+
+    # 实例化 Dataset (根据作业要求，你可以修改 num_samples 的值进行对比实验)
+    train_dataset = SFTDataset(train_data_path, num_samples=1024)
+
+    # 实例化 DataLoader
+    # 这里的 collate_fn 会在你每次取出一个 batch 时，自动把文本转换成张量 (Tensors)
+    train_dataloader = DataLoader(
+        train_dataset,
+        batch_size=train_batch_size, 
+        shuffle=True,
+        collate_fn=create_collate_fn(tokenizer)
+    )
+
+    # 加载验证集数据，用于 eval_step 时传给 evaluate_vllm
+    val_prompts, val_ground_truths = load_val_data(val_data_path)
 
     # ==========================================
     # 3. 主训练循环
@@ -175,4 +246,3 @@ def run_sft_experiment():
 
 if __name__ == "__main__":
     run_sft_experiment()
-
