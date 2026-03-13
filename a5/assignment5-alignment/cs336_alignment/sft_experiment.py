@@ -74,7 +74,7 @@ def load_val_data(val_file_path):
 
 def init_vllm(model_id: str, device: str, seed: int, gpu_memory_utilization: float = 0.3):
     """
-    启动推理过程，这里我们使用 vLLM 将模型保存在一个与策略模型独立的 GPU 上。
+    启动推理过程，使用 vLLM 将模型保存在一个与策略模型独立的 GPU 上。
     """
     vllm_set_random_seed(seed)
     # 猴子补丁（Monkeypatch）来自 TRL：
@@ -96,18 +96,7 @@ def init_vllm(model_id: str, device: str, seed: int, gpu_memory_utilization: flo
 def load_policy_into_vllm_instance(policy: PreTrainedModel, llm: LLM):
     """复制自 https://github.com/huggingface/trl/blob/22759c820867c8659d00082ba8cf004e963873c1/trl/trainer/grpo_trainer.py#L670"""
     state_dict = policy.state_dict()
-    # llm_model = llm.llm_engine.model_executor.driver_worker.model_runner.model
-    # llm_model = llm.llm_engine.model_executor.driver_worker.model_runner.model
-    # engine = llm.llm_engine
-    # print(type(engine))
-    # print([x for x in dir(engine) if not x.startswith("_")])
-    # raise RuntimeError("stop here for debug")
-    try:
-        # V1 路径通常不经过 model_executor
-        llm_model = llm.llm_engine.driver_worker.model_runner.model
-    except AttributeError:
-        # 如果还是不行，尝试 V0 路径
-        llm_model = llm.llm_engine.model_executor.driver_worker.model_runner.model
+    llm_model = llm.llm_engine.model_executor.driver_worker.model_runner.model
     llm_model.load_weights(state_dict.items())
 
 def run_sft_experiment():
@@ -135,15 +124,7 @@ def run_sft_experiment():
     policy_model.gradient_checkpointing_enable()
     policy_model.config.use_cache = False
     # 在 GPU 1 启动 vLLM 用于评估
-    print(f"正在 {vllm_device} 上初始化 vLLM...")
     vllm_engine = init_vllm(model_id, device=vllm_device, seed=42)
-    try:
-        vllm_model = vllm_engine.llm_engine.driver_worker.model_runner.model
-    except AttributeError:
-        vllm_model = vllm_engine.llm_engine.model_executor.driver_worker.model_runner.model
-        
-    actual_device = next(vllm_model.parameters()).device
-    print(f"✅ 检查完毕！vLLM 实际使用的 GPU 是: {actual_device}")
     # 采样参数
     eval_sampling_params = SamplingParams(
         temperature=1.0, 
@@ -154,10 +135,10 @@ def run_sft_experiment():
     )
 
     # 优化器与超参数设置
-    learning_rate = 1e-5 # 需要你进行微调
+    learning_rate = 1e-5
     optimizer = torch.optim.AdamW(policy_model.parameters(), lr=learning_rate)
-    train_batch_size = 1
-    gradient_accumulation_steps = 16
+    train_batch_size = 2
+    gradient_accumulation_steps = 8
     eval_interval = 50 # 每 50 个 step 评估一次
 
     # ==========================================
@@ -206,7 +187,7 @@ def run_sft_experiment():
             policy_log_probs = log_prob_dict["log_probs"]
 
             # 计算 loss 并反向传播 (已在内部除以 gradient_accumulation_steps)
-            loss, metadata = sft_microbatch_train_step(
+            scaled_loss, metadata = sft_microbatch_train_step(
                 policy_log_probs=policy_log_probs,
                 response_mask=response_mask,
                 gradient_accumulation_steps=gradient_accumulation_steps
@@ -224,7 +205,7 @@ def run_sft_experiment():
                 # 记录训练指标
                 wandb.log({
                     "train_step": global_step,
-                    "train/loss": loss.item(),
+                    "train/loss": metadata["unscaled_loss"].item(), 
                     "train/entropy": log_prob_dict["token_entropy"].mean().item()
                 })
 
