@@ -57,7 +57,9 @@ def create_collate_fn(tokenizer):
     return collate_fn
 
 # 复用之前做 baseline 时的模板
-PROMPTS_TEMPLATE = """A conversation between User and Assistant. The User asks a question, and the Assistant solves it. The Assistant first thinks about the reasoning process in the mind and then provides the User with the answer. The reasoning process is enclosed within <think> </think> and answer is enclosed within <answer> </answer> tags, respectively, i.e., <think> reasoning process here </think> <answer> answer here </answer>.
+PROMPT_TEMPLATE = """A conversation between User and Assistant. The User asks a question, and the Assistant solves it.
+The Assistant first thinks about the reasoning process in the mind and then provides the User with the answer.
+The reasoning process is enclosed within <think> </think> and answer is enclosed within <answer> </answer> tags, respectively, i.e., <think> reasoning process here </think> <answer> answer here </answer>.
 User: {question}
 Assistant: <think>\n"""
 
@@ -67,9 +69,12 @@ def load_val_data(val_file_path):
     with open(val_file_path, "r", encoding="utf-8") as f:
         for line in f:
             item = json.loads(line)
-            prompts.append(PROMPTS_TEMPLATE.format(question=item["question"]))
+            prompts.append(PROMPT_TEMPLATE.format(question=item["question"]))
             # 如果 reward_fn 需要纯数字答案，这里可以 split("####")[-1].strip()
-            ground_truths.append(item["answer"]) 
+            answer = item["answer"]
+            if "####" in answer:
+                answer = answer.split("####")[-1].strip()
+            ground_truths.append(answer)
     return prompts, ground_truths
 
 def init_vllm(model_id: str, device: str, seed: int, gpu_memory_utilization: float = 0.3):
@@ -241,8 +246,11 @@ def run_sft_experiment():
                     policy_model.train() # 切回训练模式
 
     # 训练结束后保存模型
-    policy_model.save_pretrained("/data/yourusername/sft_model")
-    tokenizer.save_pretrained("/data/yourusername/sft_model")
+    save_dir = project_root / "outputs" / "sft_model"
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    policy_model.save_pretrained(save_dir)
+    tokenizer.save_pretrained(save_dir)
 
 if __name__ == "__main__":
     run_sft_experiment()

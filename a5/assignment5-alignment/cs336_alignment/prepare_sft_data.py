@@ -30,8 +30,8 @@ def process_gsm8k_to_sft_format(input_file: str, output_file: str):
             prompt = PROMPT_TEMPLATE.format(question=question)
             
             # 2. 组装 response：接着 prompt 最后的 <think>\n 开始写推理过程，然后闭合标签并加上 answer
-            response = f"{reasoning}\n</think>\n<answer> {final_answer} </answer>"
-            
+            response = f"{reasoning}\n</think> <answer> {final_answer} </answer>"
+
             processed_data.append({
                 "prompt": prompt,
                 "response": response
