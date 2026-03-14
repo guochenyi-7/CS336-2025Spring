@@ -140,7 +140,7 @@ def run_sft_experiment():
     )
 
     # 优化器与超参数设置
-    learning_rate = 2e-6
+    learning_rate = 1e-5
     optimizer = torch.optim.AdamW(policy_model.parameters(), lr=learning_rate)
     train_batch_size = 8
     gradient_accumulation_steps = 2
