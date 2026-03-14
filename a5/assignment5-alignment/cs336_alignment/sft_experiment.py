@@ -77,7 +77,7 @@ def load_val_data(val_file_path):
             ground_truths.append(answer)
     return prompts, ground_truths
 
-def init_vllm(model_id: str, device: str, seed: int, gpu_memory_utilization: float = 0.3):
+def init_vllm(model_id: str, device: str, seed: int, gpu_memory_utilization: float = 0.8):
     """
     启动推理过程，使用 vLLM 将模型保存在一个与策略模型独立的 GPU 上。
     """
@@ -132,9 +132,9 @@ def run_sft_experiment():
     vllm_engine = init_vllm(model_id, device=vllm_device, seed=42)
     # 采样参数
     eval_sampling_params = SamplingParams(
-        temperature=1.0, 
+        temperature=0.0, 
         top_p=1.0, 
-        max_tokens=1024, 
+        max_tokens=256, 
         stop=["</answer>"],
         include_stop_str_in_output=True
     )
@@ -142,8 +142,8 @@ def run_sft_experiment():
     # 优化器与超参数设置
     learning_rate = 1e-5
     optimizer = torch.optim.AdamW(policy_model.parameters(), lr=learning_rate)
-    train_batch_size = 2
-    gradient_accumulation_steps = 8
+    train_batch_size = 4
+    gradient_accumulation_steps = 4
     eval_interval = 50 # 每 50 个 step 评估一次
 
     # ==========================================
