@@ -1,5 +1,4 @@
 import argparse
-import json
 import os
 import random
 import sys
@@ -10,145 +9,28 @@ os.environ["OMP_NUM_THREADS"] = "8"
 import torch
 import wandb
 from torch.nn.utils import clip_grad_norm_
-from torch.utils.data import DataLoader, Dataset
-from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel
+from torch.utils.data import DataLoader
 
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
-from cs336_alignment.drgrpo_grader import r1_zero_reward_fn
-from cs336_alignment.evaluate_llm import (
+from cs336_alignment.sft_helper import (
     MODEL_ID,
     VALIDATION_FILE,
     build_eval_sampling_params,
+    create_collate_fn,
+    evaluate_policy,
     init_vllm,
+    load_policy_model,
     load_val_data,
+    SFTDataset,
+    build_run_name,
+    get_response_log_probs,
+    resolve_train_data_path,
+    sft_microbatch_train_step,
 )
-from cs336_alignment.get_response_log_probs import get_response_log_probs
-from cs336_alignment.sft_microbatch_train_step import sft_microbatch_train_step
-from cs336_alignment.tokenize_prompt_and_output import tokenize_prompt_and_output
 
-DEFAULT_TRAIN_DATA_PATH = project_root / "data" / "MATH" / "sft.jsonl"
-DEFAULT_FILTERED_TRAIN_DATA_PATH = project_root / "data" / "MATH" / "sft_filtered.jsonl"
 DEFAULT_OUTPUT_ROOT = project_root / "outputs" / "sft"
-
-
-class SFTDataset(Dataset):
-    def __init__(self, data_path: str | Path, num_samples: int | None = None):
-        self.data = []
-        with open(data_path, "r", encoding="utf-8") as f:
-            for line in f:
-                self.data.append(json.loads(line))
-                if num_samples is not None and len(self.data) >= num_samples:
-                    break
-
-    def __len__(self) -> int:
-        return len(self.data)
-
-    def __getitem__(self, idx: int) -> dict[str, str]:
-        return self.data[idx]
-
-
-def create_collate_fn(tokenizer):
-    def collate_fn(batch):
-        prompt_strs = [item["prompt"] for item in batch]
-        output_strs = [item["response"] for item in batch]
-        return tokenize_prompt_and_output(prompt_strs, output_strs, tokenizer)
-
-    return collate_fn
-
-
-def load_policy_model(
-    model_id: str,
-    device: str,
-    attn_implementation: str = "flash_attention_2",
-) -> tuple[AutoTokenizer, PreTrainedModel, str]:
-    tokenizer = AutoTokenizer.from_pretrained(model_id)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    load_kwargs = {
-        "torch_dtype": torch.bfloat16,
-        "attn_implementation": attn_implementation,
-    }
-    try:
-        policy_model = AutoModelForCausalLM.from_pretrained(model_id, **load_kwargs).to(device)
-        used_attn_implementation = attn_implementation
-    except Exception as exc:
-        if attn_implementation != "flash_attention_2":
-            raise
-        print(
-            "flash_attention_2 unavailable, falling back to sdpa for policy model loading:",
-            exc,
-        )
-        policy_model = AutoModelForCausalLM.from_pretrained(
-            model_id,
-            torch_dtype=torch.bfloat16,
-            attn_implementation="sdpa",
-        ).to(device)
-        used_attn_implementation = "sdpa"
-
-    policy_model.gradient_checkpointing_enable()
-    policy_model.config.use_cache = False
-    return tokenizer, policy_model, used_attn_implementation
-
-
-def load_policy_into_vllm_instance(policy: PreTrainedModel, llm) -> None:
-    state_dict = policy.state_dict()
-    llm_model = llm.llm_engine.model_executor.driver_worker.model_runner.model
-    llm_model.load_weights(state_dict.items())
-
-
-def resolve_train_data_path(use_filtered_data: bool) -> Path:
-    return DEFAULT_FILTERED_TRAIN_DATA_PATH if use_filtered_data else DEFAULT_TRAIN_DATA_PATH
-
-
-def format_value_for_name(value: float) -> str:
-    return f"{value:.0e}".replace("+0", "").replace("-0", "-")
-
-
-def build_run_name(
-    num_train_samples: int | None,
-    learning_rate: float,
-    train_batch_size: int,
-    use_filtered_data: bool,
-) -> str:
-    sample_tag = "full" if num_train_samples is None else str(num_train_samples)
-    data_tag = "filtered" if use_filtered_data else "raw"
-    lr_tag = format_value_for_name(learning_rate)
-    return f"math_sft_{data_tag}_{sample_tag}_lr{lr_tag}_bs{train_batch_size}"
-
-
-def evaluate_policy(
-    policy_model: PreTrainedModel,
-    vllm_engine,
-    val_prompts: list[str],
-    val_ground_truths: list[str],
-    eval_sampling_params,
-    eval_step: int,
-) -> dict[str, object]:
-    load_policy_into_vllm_instance(policy_model, vllm_engine)
-    outputs = vllm_engine.generate(val_prompts, eval_sampling_params)
-    generated_responses = [output.outputs[0].text for output in outputs]
-
-    format_rewards: list[float] = []
-    answer_rewards: list[float] = []
-    total_rewards: list[float] = []
-    for response, ground_truth in zip(generated_responses, val_ground_truths):
-        scores = r1_zero_reward_fn(response, ground_truth)
-        format_rewards.append(scores["format_reward"])
-        answer_rewards.append(scores["answer_reward"])
-        total_rewards.append(scores["reward"])
-
-    metrics: dict[str, object] = {
-        "eval_step": eval_step,
-        "eval/accuracy": sum(answer_rewards) / len(answer_rewards),
-        "eval/mean_format_reward": sum(format_rewards) / len(format_rewards),
-        "eval/mean_answer_reward": sum(answer_rewards) / len(answer_rewards),
-        "eval/mean_total_reward": sum(total_rewards) / len(total_rewards),
-    }
-
-    return metrics
 
 
 def run_sft_experiment(
