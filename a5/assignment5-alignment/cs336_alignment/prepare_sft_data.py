@@ -1,59 +1,102 @@
+import argparse
 import json
+import sys
 from pathlib import Path
 
-# R1-Zero 提示词模板
-PROMPT_TEMPLATE = """A conversation between User and Assistant. The User asks a question, and the Assistant solves it.
-The Assistant first thinks about the reasoning process in the mind and then provides the User with the answer.
-The reasoning process is enclosed within <think> </think> and answer is enclosed within <answer> </answer> tags, respectively, i.e., <think> reasoning process here </think> <answer> answer here </answer>.
-User: {question}
-Assistant: <think>\n"""
+project_root = Path(__file__).parent.parent
+sys.path.insert(0, str(project_root))
 
-def process_gsm8k_to_sft_format(input_file: str, output_file: str):
-    processed_data = []
-    
-    with open(input_file, 'r', encoding='utf-8') as f:
-        for line in f:
-            item = json.loads(line)
-            question = item.get("question", "")
-            raw_answer = item.get("answer", "")
-            
-            # GSM8K 的答案格式是用 #### 分隔推理过程和最终结果
-            if "####" in raw_answer:
-                parts = raw_answer.split("####")
-                reasoning = parts[0].strip()
-                final_answer = parts[1].strip()
+from cs336_alignment.drgrpo_grader import r1_zero_reward_fn
+
+DEFAULT_INPUT_PATH = project_root / "data" / "MATH" / "sft.jsonl"
+DEFAULT_OUTPUT_PATH = project_root / "data" / "MATH" / "sft_filtered.jsonl"
+DEFAULT_STATS_PATH = project_root / "data" / "MATH" / "sft_filtered_stats.json"
+
+
+def filter_math_sft_dataset(
+    input_file: str | Path,
+    output_file: str | Path,
+    stats_file: str | Path | None = None,
+) -> dict[str, int]:
+    input_file = Path(input_file)
+    output_file = Path(output_file)
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+
+    total_examples = 0
+    kept_examples = 0
+    format_failures = 0
+    wrong_answers = 0
+
+    with input_file.open("r", encoding="utf-8") as in_f, output_file.open(
+        "w",
+        encoding="utf-8",
+    ) as out_f:
+        for line in in_f:
+            total_examples += 1
+            example = json.loads(line)
+            ground_truth = example.get("ground_truth")
+            if ground_truth is None:
+                raise ValueError(
+                    "Expected each SFT example to include a `ground_truth` field for filtering."
+                )
+
+            scores = r1_zero_reward_fn(example["response"], ground_truth)
+            if scores["answer_reward"] == 1.0:
+                out_f.write(json.dumps(example, ensure_ascii=False) + "\n")
+                kept_examples += 1
+            elif scores["format_reward"] == 0.0:
+                format_failures += 1
             else:
-                # 如果遇到没有 #### 的异常数据，直接跳过
-                continue
-            
-            # 1. 组装 prompt：将问题填入 R1-Zero 模板
-            prompt = PROMPT_TEMPLATE.format(question=question)
-            
-            # 2. 组装 response：接着 prompt 最后的 <think>\n 开始写推理过程，然后闭合标签并加上 answer
-            response = f"{reasoning}\n</think> <answer> {final_answer} </answer>"
+                wrong_answers += 1
 
-            processed_data.append({
-                "prompt": prompt,
-                "response": response
-            })
-            
-    # 将处理好的数据写入新的 jsonl 文件
-    with open(output_file, 'w', encoding='utf-8') as out_f:
-        for data in processed_data:
-            out_f.write(json.dumps(data, ensure_ascii=False) + '\n')
-            
-    print(f"数据处理完成！")
-    print(f"共成功转换了 {len(processed_data)} 条数据。")
-    print(f"已保存至: {output_file}")
+    stats = {
+        "input_examples": total_examples,
+        "kept_examples": kept_examples,
+        "filtered_examples": total_examples - kept_examples,
+        "format_failures": format_failures,
+        "wrong_answers": wrong_answers,
+    }
+
+    if stats_file is not None:
+        stats_file = Path(stats_file)
+        stats_file.parent.mkdir(parents=True, exist_ok=True)
+        with stats_file.open("w", encoding="utf-8") as f:
+            json.dump(stats, f, ensure_ascii=False, indent=2)
+
+    return stats
+
 
 if __name__ == "__main__":
-    # 根据你的项目目录结构设置路径
-    project_root = Path(__file__).parent.parent  # 如果脚本在 cs336_alignment 目录下
-    
-    input_path = project_root / "data" / "gsm8k" / "train.jsonl"
-    output_path = project_root / "data" / "gsm8k" / "sft_formatted.jsonl"
-    
-    # 确保输出目录存在
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    
-    process_gsm8k_to_sft_format(str(input_path), str(output_path))
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--input-file",
+        type=Path,
+        default=DEFAULT_INPUT_PATH,
+        help="Path to the original MATH SFT dataset.",
+    )
+    parser.add_argument(
+        "--output-file",
+        type=Path,
+        default=DEFAULT_OUTPUT_PATH,
+        help="Path to the filtered MATH SFT dataset.",
+    )
+    parser.add_argument(
+        "--stats-file",
+        type=Path,
+        default=DEFAULT_STATS_PATH,
+        help="Path to write filtering statistics as JSON.",
+    )
+    args = parser.parse_args()
+
+    stats = filter_math_sft_dataset(
+        input_file=args.input_file,
+        output_file=args.output_file,
+        stats_file=args.stats_file,
+    )
+
+    print(f"Input examples: {stats['input_examples']}")
+    print(f"Kept examples: {stats['kept_examples']}")
+    print(f"Filtered examples: {stats['filtered_examples']}")
+    print(f"Format failures: {stats['format_failures']}")
+    print(f"Wrong answers: {stats['wrong_answers']}")
+    print(f"Filtered dataset written to: {args.output_file}")
