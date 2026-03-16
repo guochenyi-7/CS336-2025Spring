@@ -1,3 +1,4 @@
+import argparse
 import os
 os.environ["OMP_NUM_THREADS"] = "8"
 
@@ -5,6 +6,7 @@ import wandb
 import json
 import sys
 from pathlib import Path
+from typing import Optional
 
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
@@ -22,10 +24,42 @@ from cs336_alignment.drgrpo_grader import r1_zero_reward_fn
 from torch.utils.data import Dataset, DataLoader
 from cs336_alignment.tokenize_prompt_and_output import tokenize_prompt_and_output
 
+PROMPT_PATH = project_root / "cs336_alignment" / "prompts" / "r1_zero.prompt"
+with open(PROMPT_PATH, "r", encoding="utf-8") as file:
+    PROMPT_TEMPLATE = file.read()
+
+DATASET_CONFIGS = {
+    "gsm8k": {
+        "train_data_path": project_root / "data" / "gsm8k" / "sft_formatted.jsonl",
+        "val_data_path": project_root / "data" / "gsm8k" / "test.jsonl",
+        "question_key": "question",
+    },
+    "math": {
+        "train_data_path": project_root / "data" / "MATH" / "sft.jsonl",
+        "val_data_path": project_root / "data" / "MATH" / "validation.jsonl",
+        "question_key": "problem",
+    },
+}
+
+
+def get_dataset_config(dataset_name: str) -> dict:
+    normalized_name = dataset_name.lower()
+    if normalized_name not in DATASET_CONFIGS:
+        supported = ", ".join(sorted(DATASET_CONFIGS))
+        raise ValueError(f"Unsupported dataset '{dataset_name}'. Expected one of: {supported}.")
+    return DATASET_CONFIGS[normalized_name]
+
+
+def extract_ground_truth(answer: str) -> str:
+    answer = answer.strip()
+    if "####" in answer:
+        answer = answer.split("####")[-1].strip()
+    return answer
+
 class SFTDataset(Dataset):
     def __init__(self, data_path, num_samples=None):
         """
-        读取已经格式化好的 sft_formatted.jsonl 文件
+        读取已经格式化好的 SFT jsonl 文件，要求至少包含 prompt/response 字段。
         """
         self.data = []
         with open(data_path, 'r', encoding='utf-8') as f:
@@ -56,31 +90,18 @@ def create_collate_fn(tokenizer):
     
     return collate_fn
 
-# 复用之前做 baseline 时的模板
-PROMPT_TEMPLATE = """A conversation between User and Assistant. The User asks a question, and the Assistant solves it.
-The Assistant first thinks about the reasoning process in the mind and then provides the User with the answer.
-The reasoning process is enclosed within <think> </think> and answer is enclosed within <answer> </answer> tags, respectively, i.e., <think> reasoning process here </think> <answer> answer here </answer>.
-User: {question}
-Assistant: <think>\n"""
-
-def load_val_data(val_file_path):
+def load_val_data(val_file_path, question_key):
     prompts = []
     ground_truths = []
     with open(val_file_path, "r", encoding="utf-8") as f:
         for line in f:
             item = json.loads(line)
-            prompts.append(PROMPT_TEMPLATE.format(question=item["question"]))
-            # 如果 reward_fn 需要纯数字答案，这里可以 split("####")[-1].strip()
-            answer = item["answer"]
-            if "####" in answer:
-                answer = answer.split("####")[-1].strip()
-            ground_truths.append(answer)
+            prompts.append(PROMPT_TEMPLATE.format(question=item[question_key]))
+            ground_truths.append(extract_ground_truth(item["answer"]))
     return prompts, ground_truths
 
 def init_vllm(model_id: str, device: str, seed: int, gpu_memory_utilization: float = 0.8):
-    """
-    启动推理过程，使用 vLLM 将模型保存在一个与策略模型独立的 GPU 上。
-    """
+    """启动推理过程，使用 vLLM 将模型保存在一个与策略模型独立的 GPU 上。"""
     vllm_set_random_seed(seed)
     # 猴子补丁（Monkeypatch）来自 TRL：
     # https://github.com/huggingface/trl/blob/22759c820867c8659d00082ba8cf004e963873c1/trl/trainer/grpo_trainer.py
@@ -104,16 +125,25 @@ def load_policy_into_vllm_instance(policy: PreTrainedModel, llm: LLM):
     llm_model = llm.llm_engine.model_executor.driver_worker.model_runner.model
     llm_model.load_weights(state_dict.items())
 
-def run_sft_experiment():
+def run_sft_experiment(dataset_name: str = "math", num_train_samples: Optional[int] = 1024):
     # ==========================================
     # 1. 初始化配置与模型加载
     # ==========================================
     model_id = "/data/a5-alignment/models/Qwen2.5-Math-1.5B"
     train_device = "cuda:0"
     vllm_device = "cuda:1"
+    dataset_config = get_dataset_config(dataset_name)
     
     # 初始化 Wandb
-    wandb.init(project="cs336-assignment5-sft")
+    wandb.init(
+        project="cs336-assignment5-sft",
+        config={
+            "dataset": dataset_name.lower(),
+            "train_data_path": str(dataset_config["train_data_path"]),
+            "val_data_path": str(dataset_config["val_data_path"]),
+            "num_train_samples": num_train_samples,
+        },
+    )
     wandb.define_metric("train_step")
     wandb.define_metric("eval_step")
     wandb.define_metric("train/*", step_metric="train_step")
@@ -149,16 +179,10 @@ def run_sft_experiment():
     # ==========================================
     # 2. 数据加载与预处理
     # ==========================================
-    # 需要将 jsonl 转换为 DataLoader，并在 collate_fn 中使用 tokenize_prompt_and_output
-    # 定义路径
-    train_data_path = str(project_root / "data" / "gsm8k" / "sft_formatted.jsonl")
-    val_data_path = str(project_root / "data" / "gsm8k" / "test.jsonl")
+    train_data_path = str(dataset_config["train_data_path"])
+    val_data_path = str(dataset_config["val_data_path"])
 
-    # 实例化 Dataset (根据作业要求，你可以修改 num_samples 的值进行对比实验)
-    train_dataset = SFTDataset(train_data_path, num_samples=1024)
-
-    # 实例化 DataLoader
-    # 这里的 collate_fn 会在你每次取出一个 batch 时，自动把文本转换成张量 (Tensors)
+    train_dataset = SFTDataset(train_data_path, num_samples=num_train_samples)
     train_dataloader = DataLoader(
         train_dataset,
         batch_size=train_batch_size, 
@@ -167,14 +191,17 @@ def run_sft_experiment():
     )
 
     # 加载验证集数据，用于 eval_step 时传给 evaluate_vllm
-    val_prompts, val_ground_truths = load_val_data(val_data_path)
+    val_prompts, val_ground_truths = load_val_data(
+        val_data_path,
+        question_key=dataset_config["question_key"],
+    )
 
     # ==========================================
     # 3. 主训练循环
     # ==========================================
     global_step = 0
     policy_model.train()
-    num_epochs = 100
+    num_epochs = 10
 
     for epoch in range(num_epochs):
         for idx, batch in enumerate(train_dataloader):
@@ -253,4 +280,18 @@ def run_sft_experiment():
     tokenizer.save_pretrained(save_dir)
 
 if __name__ == "__main__":
-    run_sft_experiment()
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--dataset",
+        choices=sorted(DATASET_CONFIGS),
+        default="math",
+        help="Dataset to use for SFT training and validation.",
+    )
+    parser.add_argument(
+        "--num-train-samples",
+        type=int,
+        default=1024,
+        help="Optional cap on the number of training samples to load.",
+    )
+    args = parser.parse_args()
+    run_sft_experiment(dataset_name=args.dataset, num_train_samples=args.num_train_samples)

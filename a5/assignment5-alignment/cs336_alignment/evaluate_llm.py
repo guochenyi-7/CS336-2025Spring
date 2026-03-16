@@ -1,3 +1,4 @@
+import argparse
 import sys
 from pathlib import Path
 from unittest.mock import patch
@@ -12,25 +13,46 @@ from vllm.model_executor.utils import set_random_seed as vllm_set_random_seed
 from typing import Callable, List
 from cs336_alignment.drgrpo_grader import r1_zero_reward_fn
 
-PROMPT_TEMPLATE = """A conversation between User and Assistant. The User asks a question, and the Assistant solves it. The Assistant first thinks about the reasoning process in the mind and then provides the User with the answer. The reasoning process is enclosed within <think> </think> and answer is enclosed within <answer> </answer> tags, respectively, i.e., <think> reasoning process here </think> <answer> answer here </answer>.
-User: {question}
-Assistant: <think>
-"""
+PROMPT_PATH = project_root / "cs336_alignment" / "prompts" / "r1_zero.prompt"
+with open(PROMPT_PATH, "r", encoding="utf-8") as file:
+    PROMPT_TEMPLATE = file.read()
+
+DATASET_CONFIGS = {
+    "gsm8k": {
+        "validation_file": project_root / "data" / "gsm8k" / "test.jsonl",
+        "question_key": "question",
+    },
+    "math": {
+        "validation_file": project_root / "data" / "MATH" / "validation.jsonl",
+        "question_key": "problem",
+    },
+}
 
 
-def load_val_data(val_file_path: str) -> tuple[list[str], list[str]]:
+def get_dataset_config(dataset_name: str) -> dict:
+    normalized_name = dataset_name.lower()
+    if normalized_name not in DATASET_CONFIGS:
+        supported = ", ".join(sorted(DATASET_CONFIGS))
+        raise ValueError(f"Unsupported dataset '{dataset_name}'. Expected one of: {supported}.")
+    return DATASET_CONFIGS[normalized_name]
+
+
+def extract_ground_truth(answer: str) -> str:
+    answer = answer.strip()
+    if "####" in answer:
+        answer = answer.split("####")[-1].strip()
+    return answer
+
+
+def load_val_data(val_file_path: str, question_key: str) -> tuple[list[str], list[str]]:
     prompts = []
     ground_truths = []
 
     with open(val_file_path, "r", encoding="utf-8") as f:
         for line in f:
             item = json.loads(line)
-            prompts.append(PROMPT_TEMPLATE.format(question=item["question"]))
-
-            answer = item["answer"]
-            if "####" in answer:
-                answer = answer.split("####")[-1].strip()
-            ground_truths.append(answer)
+            prompts.append(PROMPT_TEMPLATE.format(question=item[question_key]))
+            ground_truths.append(extract_ground_truth(item["answer"]))
 
     return prompts, ground_truths
 
@@ -91,6 +113,16 @@ def evaluate_vllm(
     return correct_count / len(prompts)
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--dataset",
+        choices=sorted(DATASET_CONFIGS),
+        default="math",
+        help="Dataset to evaluate on.",
+    )
+    args = parser.parse_args()
+    dataset_config = get_dataset_config(args.dataset)
+
     model_id = "/data/a5-alignment/models/Qwen2.5-Math-1.5B"
     sampling_params = SamplingParams(
         temperature=0.0,
@@ -100,11 +132,14 @@ if __name__ == "__main__":
         include_stop_str_in_output=True,
     )
 
-    validation_file = project_root / "data" / "gsm8k" / "test.jsonl"
-    prompts, ground_truths = load_val_data(str(validation_file))
+    validation_file = dataset_config["validation_file"]
+    prompts, ground_truths = load_val_data(
+        str(validation_file),
+        question_key=dataset_config["question_key"],
+    )
     output_file = project_root / "cs336_alignment" / "results.jsonl"
 
-    llm = init_vllm(model_id, gpu_memory_utilization=0.8)
+    llm = init_vllm(model_id, gpu_memory_utilization=0.85)
     accuracy = evaluate_vllm(
         llm,
         r1_zero_reward_fn,
