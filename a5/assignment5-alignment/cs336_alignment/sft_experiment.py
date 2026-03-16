@@ -163,7 +163,7 @@ def run_sft_experiment(
     eval_interval = 50
     train_device = "cuda:0"
     vllm_device = "cuda:1"
-    gpu_memory_utilization = 0.85
+    gpu_memory_utilization = 0.7
     wandb_project = "cs336-assignment5-sft"
     train_data_path = resolve_train_data_path(use_filtered_data)
     wandb_run_name = build_run_name(
