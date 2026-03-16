@@ -25,7 +25,6 @@ from cs336_alignment.evaluate_llm import (
     load_val_data,
 )
 from cs336_alignment.get_response_log_probs import get_response_log_probs
-from cs336_alignment.log_generations import log_generations
 from cs336_alignment.sft_microbatch_train_step import sft_microbatch_train_step
 from cs336_alignment.tokenize_prompt_and_output import tokenize_prompt_and_output
 
@@ -100,41 +99,6 @@ def load_policy_into_vllm_instance(policy: PreTrainedModel, llm) -> None:
     llm_model.load_weights(state_dict.items())
 
 
-@torch.no_grad()
-def compute_response_entropy_and_lengths(
-    policy_model: PreTrainedModel,
-    tokenizer,
-    prompts: list[str],
-    responses: list[str],
-    device: str,
-) -> tuple[list[float], list[int]]:
-    tokenized_batch = tokenize_prompt_and_output(prompts, responses, tokenizer)
-    input_ids = tokenized_batch["input_ids"].to(device)
-    labels = tokenized_batch["labels"].to(device)
-    response_mask = tokenized_batch["response_mask"].to(device).float()
-
-    scored_batch = get_response_log_probs(
-        model=policy_model,
-        input_ids=input_ids,
-        labels=labels,
-        return_token_entropy=True,
-    )
-    response_lengths = response_mask.sum(dim=1)
-    safe_lengths = response_lengths.clamp_min(1.0)
-    mean_response_entropies = (
-        (scored_batch["token_entropy"] * response_mask).sum(dim=1) / safe_lengths
-    )
-    return mean_response_entropies.cpu().tolist(), response_lengths.long().cpu().tolist()
-
-
-def select_log_subset_indices(total_examples: int, count: int, seed: int) -> list[int]:
-    if count <= 0:
-        return []
-    count = min(count, total_examples)
-    rng = random.Random(seed)
-    return sorted(rng.sample(range(total_examples), count))
-
-
 def resolve_train_data_path(use_filtered_data: bool) -> Path:
     return DEFAULT_FILTERED_TRAIN_DATA_PATH if use_filtered_data else DEFAULT_TRAIN_DATA_PATH
 
@@ -157,15 +121,11 @@ def build_run_name(
 
 def evaluate_policy(
     policy_model: PreTrainedModel,
-    tokenizer,
     vllm_engine,
     val_prompts: list[str],
     val_ground_truths: list[str],
     eval_sampling_params,
     eval_step: int,
-    output_dir: Path,
-    train_device: str,
-    log_subset_indices: list[int],
 ) -> dict[str, object]:
     load_policy_into_vllm_instance(policy_model, vllm_engine)
     outputs = vllm_engine.generate(val_prompts, eval_sampling_params)
@@ -188,29 +148,6 @@ def evaluate_policy(
         "eval/mean_total_reward": sum(total_rewards) / len(total_rewards),
     }
 
-    if log_subset_indices:
-        subset_prompts = [val_prompts[idx] for idx in log_subset_indices]
-        subset_responses = [generated_responses[idx] for idx in log_subset_indices]
-        subset_ground_truths = [val_ground_truths[idx] for idx in log_subset_indices]
-        subset_entropies, subset_lengths = compute_response_entropy_and_lengths(
-            policy_model=policy_model,
-            tokenizer=tokenizer,
-            prompts=subset_prompts,
-            responses=subset_responses,
-            device=train_device,
-        )
-        generation_metrics = log_generations(
-            prompts=subset_prompts,
-            responses=subset_responses,
-            ground_truths=subset_ground_truths,
-            reward_fn=r1_zero_reward_fn,
-            response_entropies=subset_entropies,
-            response_lengths=subset_lengths,
-            prefix="eval_generations",
-            output_path=output_dir / "generation_logs" / f"eval_step_{eval_step}.jsonl",
-        )
-        metrics.update(generation_metrics)
-
     return metrics
 
 
@@ -227,7 +164,6 @@ def run_sft_experiment(
     train_device = "cuda:0"
     vllm_device = "cuda:1"
     gpu_memory_utilization = 0.85
-    log_generations_count = 16
     wandb_project = "cs336-assignment5-sft"
     train_data_path = resolve_train_data_path(use_filtered_data)
     wandb_run_name = build_run_name(
@@ -265,11 +201,6 @@ def run_sft_experiment(
         collate_fn=create_collate_fn(tokenizer),
     )
     val_prompts, val_ground_truths = load_val_data(VALIDATION_FILE)
-    log_subset_indices = select_log_subset_indices(
-        total_examples=len(val_prompts),
-        count=log_generations_count,
-        seed=seed,
-    )
 
     wandb.init(
         project=wandb_project,
@@ -279,7 +210,6 @@ def run_sft_experiment(
     wandb.define_metric("eval_step")
     wandb.define_metric("train/*", step_metric="train_step")
     wandb.define_metric("eval/*", step_metric="eval_step")
-    wandb.define_metric("eval_generations/*", step_metric="eval_step")
 
     global_step = 0
     optimizer.zero_grad(set_to_none=True)
@@ -338,15 +268,11 @@ def run_sft_experiment(
                     policy_model.eval()
                     eval_metrics = evaluate_policy(
                         policy_model=policy_model,
-                        tokenizer=tokenizer,
                         vllm_engine=vllm_engine,
                         val_prompts=val_prompts,
                         val_ground_truths=val_ground_truths,
                         eval_sampling_params=eval_sampling_params,
                         eval_step=global_step,
-                        output_dir=output_dir,
-                        train_device=train_device,
-                        log_subset_indices=log_subset_indices,
                     )
                     wandb.log(eval_metrics)
                     print(
