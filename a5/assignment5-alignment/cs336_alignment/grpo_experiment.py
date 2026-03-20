@@ -69,7 +69,7 @@ class GRPOConfig:
     use_std_normalization: bool = True
 
     eval_every: int = 10
-    num_eval_examples: int = 1024
+    num_eval_examples: int | None = None
     seed: int = 42
     device: str = "cuda"
 
@@ -198,7 +198,12 @@ def parse_args() -> argparse.Namespace:
         help="Whether to divide group-centered rewards by the group std.",
     )
     parser.add_argument("--eval-every", type=int, default=GRPOConfig.eval_every)
-    parser.add_argument("--num-eval-examples", type=int, default=GRPOConfig.num_eval_examples)
+    parser.add_argument(
+        "--num-eval-examples",
+        type=int,
+        default=GRPOConfig.num_eval_examples,
+        help="Optional cap on validation examples. Defaults to the full validation set.",
+    )
     parser.add_argument("--seed", type=int, default=GRPOConfig.seed)
     parser.add_argument("--policy-device", type=str, default="cuda:0")
     parser.add_argument("--vllm-device", type=str, default="cuda:1")
@@ -526,7 +531,11 @@ def grpo_train_loop(
         if (grpo_step + 1) % cfg.eval_every == 0:
             policy.eval()
             load_policy_into_vllm_instance(policy, vllm_model)
-            eval_examples = val_examples[:cfg.num_eval_examples]
+            eval_examples = (
+                val_examples
+                if cfg.num_eval_examples is None
+                else val_examples[:cfg.num_eval_examples]
+            )
 
             eval_metrics = evaluate_vllm(
                 vllm_model=vllm_model,
@@ -546,6 +555,10 @@ def grpo_train_loop(
             )
 
             log_dict("eval", grpo_step + 1, eval_metrics)
+            print(
+                f"GRPO step {grpo_step + 1} | "
+                f"Validation Accuracy: {eval_metrics['accuracy']:.2%}"
+            )
 
     if wandb_started_here:
         wandb.finish()
