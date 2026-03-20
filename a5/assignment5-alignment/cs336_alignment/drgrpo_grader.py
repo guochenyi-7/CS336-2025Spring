@@ -19,10 +19,8 @@ Provides a math answer grading function with high recall.
 Based on HF math_verify, verl, open reasoner zero, etc.
 """
 
-import logging
 import re
 import signal
-import warnings
 from itertools import islice, zip_longest
 from math import isclose
 from typing import Optional
@@ -35,7 +33,6 @@ from sympy import N, simplify
 from sympy.parsing import sympy_parser
 from sympy.parsing.latex import parse_latex
 from sympy.parsing.sympy_parser import parse_expr
-from sympy.utilities.exceptions import SymPyDeprecationWarning
 
 
 # Dan Hendrycks' code
@@ -192,66 +189,38 @@ unit_texts = [
 unit_texts.extend([t + "s" for t in unit_texts])
 
 
-def _fix_fracs_shorthand(string: str) -> str:
-    substrs = string.split("\\frac")
-    new_str = substrs[0]
-    if len(substrs) > 1:
-        substrs = substrs[1:]
-        for substr in substrs:
-            new_str += "\\frac"
-            if not substr:
-                return string
-            if substr[0] == "{":
-                new_str += substr
-            else:
-                if len(substr) < 2:
-                    return string
-                a = substr[0]
-                b = substr[1]
-                if b != "{":
-                    if len(substr) > 2:
-                        post_substr = substr[2:]
-                        new_str += "{" + a + "}{" + b + "}" + post_substr
-                    else:
-                        new_str += "{" + a + "}{" + b + "}"
-                else:
-                    if len(substr) > 2:
-                        post_substr = substr[2:]
-                        new_str += "{" + a + "}" + b + post_substr
-                    else:
-                        new_str += "{" + a + "}" + b
-    return new_str
-
-
-def _fix_sqrt_shorthand(string: str) -> str:
-    if "\\sqrt" not in string:
-        return string
-    splits = string.split("\\sqrt")
-    new_string = splits[0]
-    for split in splits[1:]:
-        if not split:
-            return string
-        if split[0] != "{":
-            a = split[0]
-            new_substr = "\\sqrt{" + a + "}" + split[1:]
-        else:
-            new_substr = "\\sqrt" + split
-        new_string += new_substr
-    return new_string
-
-
-def _latex_to_text_safely(expr: str) -> str:
-    prev_disable_level = logging.root.manager.disable
-    try:
-        # pylatexenc logs noisy warnings for malformed model outputs that we
-        # already handle via fallback grading paths.
-        logging.disable(logging.ERROR)
-        return latex2text.LatexNodes2Text().latex_to_text(expr)
-    finally:
-        logging.disable(prev_disable_level)
-
-
 def _strip_string(string):
+    def _fix_fracs(string):
+        substrs = string.split("\\frac")
+        new_str = substrs[0]
+        if len(substrs) > 1:
+            substrs = substrs[1:]
+            for substr in substrs:
+                new_str += "\\frac"
+                if substr[0] == "{":
+                    new_str += substr
+                else:
+                    try:
+                        assert len(substr) >= 2
+                    except:
+                        return string
+                    a = substr[0]
+                    b = substr[1]
+                    if b != "{":
+                        if len(substr) > 2:
+                            post_substr = substr[2:]
+                            new_str += "{" + a + "}{" + b + "}" + post_substr
+                        else:
+                            new_str += "{" + a + "}{" + b + "}"
+                    else:
+                        if len(substr) > 2:
+                            post_substr = substr[2:]
+                            new_str += "{" + a + "}" + b + post_substr
+                        else:
+                            new_str += "{" + a + "}" + b
+        string = new_str
+        return string
+
     def _fix_a_slash_b(string):
         if len(string.split("/")) != 2:
             return string
@@ -274,6 +243,20 @@ def _strip_string(string):
             return splits[0]
         else:
             return string
+
+    def _fix_sqrt(string):
+        if "\\sqrt" not in string:
+            return string
+        splits = string.split("\\sqrt")
+        new_string = splits[0]
+        for split in splits[1:]:
+            if split[0] != "{":
+                a = split[0]
+                new_substr = "\\sqrt{" + a + "}" + split[1:]
+            else:
+                new_substr = "\\sqrt" + split
+            new_string += new_substr
+        return new_string
 
     # linebreaks
     string = string.replace("\n", "")
@@ -351,13 +334,13 @@ def _strip_string(string):
             string = string.split("=")[1]
 
     # fix sqrt3 --> sqrt{3}
-    string = _fix_sqrt_shorthand(string)
+    string = _fix_sqrt(string)
 
     # remove spaces
     string = string.replace(" ", "")
 
     # \frac1b or \frac12 --> \frac{1}{b} and \frac{1}{2}, etc. Even works with \frac1{72} (but not \frac{72}1). Also does a/b --> \\frac{a}{b}
-    string = _fix_fracs_shorthand(string)
+    string = _fix_fracs(string)
 
     # manually change 0.5 --> \frac{1}{2}
     if string == "0.5":
@@ -694,25 +677,21 @@ TUPLE_CHARS = "()[]"
 def _sympy_parse(expr: str):
     """Parses an expression with sympy."""
     py_expr = expr.replace("^", "**")
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", SymPyDeprecationWarning)
-        return sympy_parser.parse_expr(
-            py_expr,
-            transformations=(
-                sympy_parser.standard_transformations
-                + (sympy_parser.implicit_multiplication_application,)
-            ),
-        )
+    return sympy_parser.parse_expr(
+        py_expr,
+        transformations=(
+            sympy_parser.standard_transformations
+            + (sympy_parser.implicit_multiplication_application,)
+        ),
+    )
 
 
 def _parse_latex(expr: str) -> str:
     """Attempts to parse latex to an expression sympy can read."""
     expr = expr.replace("\\tfrac", "\\frac")
     expr = expr.replace("\\dfrac", "\\frac")
-    expr = _fix_sqrt_shorthand(expr)
-    expr = _fix_fracs_shorthand(expr)
     expr = expr.replace("\\frac", " \\frac")  # Play nice with mixed numbers.
-    expr = _latex_to_text_safely(expr)
+    expr = latex2text.LatexNodes2Text().latex_to_text(expr)
 
     # Replace the specific characters that this parser uses.
     expr = expr.replace("√", "sqrt")
@@ -881,10 +860,8 @@ def are_equal_under_sympy(ground_truth_normalized: str, given_normalized: str):
     try:
         expr = f"({ground_truth_normalized})-({given_normalized})"
         if should_allow_eval(expr):
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", SymPyDeprecationWarning)
-                sympy_diff = _sympy_parse(expr)
-                simplified = sympy.simplify(sympy_diff)
+            sympy_diff = _sympy_parse(expr)
+            simplified = sympy.simplify(sympy_diff)
             if simplified == 0:
                 are_equal = True
     except:
