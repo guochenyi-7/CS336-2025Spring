@@ -48,7 +48,7 @@ PROMPT_FILES = {
 @dataclass
 class GRPOConfig:
     n_grpo_steps: int = 200
-    learning_rate: float = 1e-5
+    learning_rate: float = 3e-5
     advantage_eps: float = 1e-6
 
     rollout_batch_size: int = 256
