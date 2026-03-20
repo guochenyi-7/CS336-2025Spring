@@ -143,6 +143,7 @@ def grpo_microbatch_train_step(
     scaled_loss.backward()
 
     metadata = dict(metadata)
+    metadata["unscaled_loss"] = loss.detach()
     metadata["per_example_loss"] = per_example_loss.detach().mean()
     
     return scaled_loss.detach(), metadata
