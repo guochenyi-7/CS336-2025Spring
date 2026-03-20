@@ -47,9 +47,9 @@ python3 grpo_experiment.py \
   --policy-device cuda:0 \
   --vllm-device cuda:1 \
   --n-grpo-steps 200 \
-  --rollout-batch-size 128 \
-  --train-batch-size 128 \
-  --gradient-accumulation-steps 32 \
+  --rollout-batch-size 64 \
+  --train-batch-size 64 \
+  --gradient-accumulation-steps 16 \
   --group-size 4 \
   --sampling-max-tokens 256 \
   --gpu-memory-utilization 0.8

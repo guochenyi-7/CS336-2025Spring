@@ -68,7 +68,7 @@ class GRPOConfig:
     loss_type: LossType = "reinforce_with_baseline"
     use_std_normalization: bool = True
 
-    eval_every: int = 10
+    eval_every: int = 100
     num_eval_examples: int | None = None
     seed: int = 42
     device: str = "cuda"
