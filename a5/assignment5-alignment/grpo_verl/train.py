@@ -26,6 +26,11 @@ ASSIGNMENT_GRPO_CLIP_LOSS = "assignment_grpo_clip"
 ASSIGNMENT_GRPO_ADV = "assignment_grpo"
 ASSIGNMENT_RAW_REWARD_ADV = "assignment_raw_reward"
 
+EXTENSION_CONFIG_KEYS = {
+    "algorithm.advantage_eps",
+    "reward.custom_reward_function.reward_kwargs",
+}
+
 
 def format_value_for_name(value: float) -> str:
     return f"{value:.0e}".replace("+0", "").replace("-0", "-")
@@ -340,7 +345,7 @@ def _apply_common_overrides(config: Any, user_cfg: Any, omega_conf_cls) -> None:
         config,
         updates,
         omega_conf_cls,
-        allow_new_child_keys={"reward.custom_reward_function.reward_kwargs"},
+        allow_new_child_keys=EXTENSION_CONFIG_KEYS,
     )
 
     omega_conf_cls.update(
