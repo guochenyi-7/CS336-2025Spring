@@ -78,6 +78,15 @@ def _assert_exists(path: Path, description: str) -> None:
         raise FileNotFoundError(f"{description} not found: {path}")
 
 
+def _resolve_model_path(user_cfg: Any) -> str:
+    raw_path = str(user_cfg.verl.get("model_path", DEFAULT_MODEL_PATH))
+    expanded_path = Path(raw_path).expanduser()
+    if raw_path.startswith(("~", ".")) or expanded_path.is_absolute():
+        _assert_exists(expanded_path, "Model path")
+        return str(expanded_path)
+    return raw_path
+
+
 def _import_verl_stack() -> dict[str, Any]:
     try:
         from hydra import compose, initialize_config_dir
@@ -224,6 +233,7 @@ def _apply_dot_overrides(
 
 def _apply_common_overrides(config: Any, user_cfg: Any, omega_conf_cls) -> None:
     prompt_batch_size, prompt_update_batch_size, microbatch_per_gpu = _resolve_batch_mapping(user_cfg)
+    model_path = _resolve_model_path(user_cfg)
 
     run_name = user_cfg.run.run_name or build_run_name(
         experiment=str(user_cfg.run.experiment),
@@ -268,7 +278,7 @@ def _apply_common_overrides(config: Any, user_cfg: Any, omega_conf_cls) -> None:
         "data.truncation": "error",
         "data.trust_remote_code": bool(user_cfg.verl.trust_remote_code),
         "actor_rollout_ref.hybrid_engine": bool(user_cfg.verl.hybrid_engine),
-        "actor_rollout_ref.model.path": DEFAULT_MODEL_PATH,
+        "actor_rollout_ref.model.path": model_path,
         "actor_rollout_ref.model.trust_remote_code": bool(user_cfg.verl.trust_remote_code),
         "actor_rollout_ref.model.enable_gradient_checkpointing": bool(
             user_cfg.verl.enable_gradient_checkpointing
@@ -287,6 +297,8 @@ def _apply_common_overrides(config: Any, user_cfg: Any, omega_conf_cls) -> None:
         "actor_rollout_ref.actor.data_loader_seed": int(user_cfg.run.seed),
         "actor_rollout_ref.actor.optim.lr": float(user_cfg.grpo.learning_rate),
         "actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu": microbatch_per_gpu,
+        "critic.model.tokenizer_path": model_path,
+        "actor_rollout_ref.rollout.name": str(user_cfg.verl.get("rollout_name", "vllm")),
         "actor_rollout_ref.rollout.prompt_length": int(user_cfg.generation.max_prompt_length),
         "actor_rollout_ref.rollout.response_length": int(user_cfg.generation.max_response_length),
         "actor_rollout_ref.rollout.temperature": float(user_cfg.generation.temperature),
