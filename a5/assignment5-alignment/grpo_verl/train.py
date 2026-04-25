@@ -176,9 +176,45 @@ def _resolve_batch_mapping(user_cfg: Any) -> tuple[int, int, int]:
     return prompts_per_rollout_batch, prompts_per_update_minibatch, microbatch_per_gpu
 
 
-def _apply_dot_overrides(config: Any, overrides: dict[str, Any], omega_conf_cls) -> None:
-    for key, value in overrides.items():
+def _apply_dot_override_allowing_new_child(
+    config: Any,
+    key: str,
+    value: Any,
+    omega_conf_cls,
+) -> None:
+    # Some verl releases structure config nodes before declaring extension mappings.
+    parent_key = key.rsplit(".", 1)[0]
+    parent = config if parent_key == key else omega_conf_cls.select(config, parent_key)
+    if parent is None:
         omega_conf_cls.update(config, key, value, merge=True)
+        return
+
+    previous_struct = omega_conf_cls.is_struct(parent)
+    target = omega_conf_cls.select(config, key)
+    previous_target_struct = None if target is None else omega_conf_cls.is_struct(target)
+    omega_conf_cls.set_struct(parent, False)
+    if target is not None:
+        omega_conf_cls.set_struct(target, False)
+    try:
+        omega_conf_cls.update(config, key, value, merge=True)
+    finally:
+        if target is not None:
+            omega_conf_cls.set_struct(target, previous_target_struct)
+        omega_conf_cls.set_struct(parent, previous_struct)
+
+
+def _apply_dot_overrides(
+    config: Any,
+    overrides: dict[str, Any],
+    omega_conf_cls,
+    allow_new_child_keys: set[str] | None = None,
+) -> None:
+    allow_new_child_keys = allow_new_child_keys or set()
+    for key, value in overrides.items():
+        if key in allow_new_child_keys:
+            _apply_dot_override_allowing_new_child(config, key, value, omega_conf_cls)
+        else:
+            omega_conf_cls.update(config, key, value, merge=True)
 
 
 def _apply_common_overrides(config: Any, user_cfg: Any, omega_conf_cls) -> None:
@@ -272,8 +308,10 @@ def _apply_common_overrides(config: Any, user_cfg: Any, omega_conf_cls) -> None:
         "reward.num_workers": int(user_cfg.verl.reward_num_workers),
         "reward.custom_reward_function.path": str(REWARD_FILE),
         "reward.custom_reward_function.name": "my_reward_fn",
-        "reward.custom_reward_function.reward_kwargs.fast": bool(user_cfg.grpo.fast_reward),
-        "reward.custom_reward_function.reward_kwargs.reward_style": str(user_cfg.grpo.reward_style),
+        "reward.custom_reward_function.reward_kwargs": {
+            "fast": bool(user_cfg.grpo.fast_reward),
+            "reward_style": str(user_cfg.grpo.reward_style),
+        },
         "reward.reward_manager.source": "register",
         "reward.reward_manager.name": "naive",
         "reward.reward_model.enable": False,
@@ -298,7 +336,12 @@ def _apply_common_overrides(config: Any, user_cfg: Any, omega_conf_cls) -> None:
         "trainer.resume_mode": str(user_cfg.verl.resume_mode),
     }
 
-    _apply_dot_overrides(config, updates, omega_conf_cls)
+    _apply_dot_overrides(
+        config,
+        updates,
+        omega_conf_cls,
+        allow_new_child_keys={"reward.custom_reward_function.reward_kwargs"},
+    )
 
     omega_conf_cls.update(
         config,
